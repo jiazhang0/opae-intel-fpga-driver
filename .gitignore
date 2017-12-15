@@ -1,0 +1,17 @@
+*~
+
+.*.swp
+.*.cmd
+
+*.o
+*.ko
+
+.tmp_versions
+
+Module.symvers
+fpga-mgr-mod.mod.c
+intel-fpga-afu.mod.c
+intel-fpga-fme.mod.c
+intel-fpga-pci.mod.c
+modules.order
+
