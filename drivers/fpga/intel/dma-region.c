@@ -14,6 +14,7 @@
 
 #include "backport.h"
 #include <linux/uaccess.h>
+#include <linux/sched/signal.h>
 
 #include "afu.h"
 
