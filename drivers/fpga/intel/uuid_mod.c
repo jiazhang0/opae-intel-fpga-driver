@@ -19,6 +19,7 @@
 #include <linux/export.h>
 #include <linux/uuid.h>
 #include <linux/random.h>
+#include <linux/version.h>
 
 // By Abelardo
 #define UUID_STRING_LEN 36
@@ -54,12 +55,16 @@ void uuid_le_gen(uuid_le *lu)
     /* version 4 : random generation */
     lu->b[7] = (lu->b[7] & 0x0F) | 0x40;
 }
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3,13,0)
 void uuid_be_gen(uuid_be *bu)
 {
     __uuid_gen_common(bu->b);
     /* version 4 : random generation */
     bu->b[6] = (bu->b[6] & 0x0F) | 0x40;
 }
+#endif /* LINUX_VERSION_CODE < KERNEL_VERSION(3,13,0) */
+
 /**
  * uuid_is_valid - checks if UUID string valid
  * @uuid:   UUID string to check
@@ -101,7 +106,10 @@ int uuid_le_to_bin(const char *uuid, uuid_le *u)
 {
     return __uuid_to_bin(uuid, u->b, uuid_le_index);
 }
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3,13,0)
 int uuid_be_to_bin(const char *uuid, uuid_be *u)
 {
     return __uuid_to_bin(uuid, u->b, uuid_be_index);
 }
+#endif /* LINUX_VERSION_CODE < KERNEL_VERSION(3,13,0) */
