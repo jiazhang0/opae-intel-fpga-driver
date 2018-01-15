@@ -28,6 +28,7 @@
 #include <linux/uuid.h>
 #include <linux/kdev_t.h>
 #include <linux/mfd/core.h>
+#include <linux/mtd/altera-asmip2.h>
 
 #include "backport.h"
 #include "feature-dev.h"
@@ -63,6 +64,10 @@ struct cci_drvdata {
 	int released_port_num;
 
 	struct list_head regions;
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,8,0)
+	struct msix_entry *msix_entries;
+#endif
 };
 
 struct cci_pci_region {
@@ -510,36 +515,6 @@ static void build_info_free(struct build_feature_devs_info *binfo)
 	devm_kfree(&binfo->pdev->dev, binfo);
 }
 
-#define FEATURE_TYPE_AFU	0x1
-#define FEATURE_TYPE_PRIVATE	0x3
-
-/*
- * FPGA hardware bug, FME/PORT GUID didn't follow the UUID/GUID rules, it
- * it reported at:
- *    https://hsdes.intel.com/appstore/article/#/1504370325
- */
-/* #define FEATURE_FME_GUID "BFAF2AE9-4A52-46E3-82FE-38F0F9E17764" */
-#define FEATURE_FME_GUID "f9e17764-38f0-82fe-e346-524ae92aafbf"
-#define FEATURE_PORT_GUID "6b355b87-b06c-9642-eb42-8d139398b43a"
-
-static bool feature_is_fme(struct feature_afu_header *afu_hdr)
-{
-	uuid_le u;
-
-	uuid_le_to_bin(FEATURE_FME_GUID, &u);
-
-	return !uuid_le_cmp(u, afu_hdr->guid);
-}
-
-static bool feature_is_port(struct feature_afu_header *afu_hdr)
-{
-	uuid_le u;
-
-	uuid_le_to_bin(FEATURE_PORT_GUID, &u);
-
-	return !uuid_le_cmp(u, afu_hdr->guid);
-}
-
 /*
  * UAFU GUID is dynamic as it can be changed after FME downloads different
  * Green Bitstream to the port, so we treat the unknown GUIDs which are
@@ -554,15 +529,21 @@ static bool feature_is_UAFU(struct build_feature_devs_info *binfo)
 	return true;
 }
 
-static void
+static int
 build_info_add_sub_feature(struct build_feature_devs_info *binfo,
 			   int feature_id, const char *feature_name,
-			   resource_size_t resource_size, void __iomem *start)
+			   resource_size_t resource_size, void __iomem *start,
+			   unsigned int vec_start, unsigned int vec_cnt)
 {
-
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,8,0)
+	struct cci_drvdata *drvdata = dev_get_drvdata(&binfo->pdev->dev);
+	struct msix_entry *msix_entries = drvdata->msix_entries;
+#endif
 	struct platform_device *fdev = binfo->feature_dev;
 	struct feature_platform_data *pdata = dev_get_platdata(&fdev->dev);
 	struct resource *res = &fdev->resource[feature_id];
+	struct feature_irq_ctx *ctx = NULL;
+	int i;
 
 	res->start = pci_resource_start(binfo->pdev, binfo->current_bar) +
 		start - binfo->ioaddr;
@@ -570,8 +551,30 @@ build_info_add_sub_feature(struct build_feature_devs_info *binfo,
 	res->flags = IORESOURCE_MEM;
 	res->name = feature_name;
 
-	feature_platform_data_add(pdata, feature_id,
-				  feature_name, feature_id, start);
+	/*
+	 * Add interrupt information for the feature which support interrupt.
+	 */
+	if (vec_cnt) {
+		if (vec_start + vec_cnt > pci_msix_vec_count(binfo->pdev))
+			return -EINVAL;
+
+		ctx = devm_kcalloc(&binfo->pdev->dev, vec_cnt,
+						sizeof(*ctx), GFP_KERNEL);
+		if (!ctx)
+			return -ENOMEM;
+
+		for (i = 0; i < vec_cnt; i++)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,8,0)
+			ctx[i].irq = msix_entries[vec_start + i].vector;
+#else
+			ctx[i].irq = pci_irq_vector(binfo->pdev, vec_start + i);
+#endif
+	}
+
+	feature_platform_data_add(pdata, feature_id, feature_name, feature_id,
+				  start, ctx, vec_cnt);
+
+	return 0;
 }
 
 struct feature_info {
@@ -579,6 +582,8 @@ struct feature_info {
 	resource_size_t resource_size;
 	int feature_index;
 	int revision_id;
+	unsigned int vec_start;
+	unsigned int vec_cnt;
 };
 
 /* indexed by fme feature IDs which are defined in 'enum fme_feature_id'. */
@@ -602,10 +607,10 @@ static struct feature_info fme_features[] = {
 		.revision_id = FME_POWER_MGMT_REVISION
 	},
 	{
-		.name = FME_FEATURE_GLOBAL_PERF,
-		.resource_size = sizeof(struct feature_fme_gperf),
-		.feature_index = FME_FEATURE_ID_GLOBAL_PERF,
-		.revision_id = FME_GLOBAL_PERF_REVISION
+		.name = FME_FEATURE_GLOBAL_IPERF,
+		.resource_size = sizeof(struct feature_fme_iperf),
+		.feature_index = FME_FEATURE_ID_GLOBAL_IPERF,
+		.revision_id = FME_GLOBAL_IPERF_REVISION
 	},
 	{
 		.name = FME_FEATURE_GLOBAL_ERR,
@@ -618,6 +623,24 @@ static struct feature_info fme_features[] = {
 		.resource_size = sizeof(struct feature_fme_pr),
 		.feature_index = FME_FEATURE_ID_PR_MGMT,
 		.revision_id = FME_PR_MGMT_REVISION
+	},
+	{
+		.name = FME_FEATURE_HSSI_ETH,
+		.resource_size = sizeof(struct feature_fme_hssi),
+		.feature_index = FME_FEATURE_ID_HSSI_ETH,
+		.revision_id = FME_HSSI_ETH_REVISION
+	},
+	{
+		.name = FME_FEATURE_GLOBAL_DPERF,
+		.resource_size = sizeof(struct feature_fme_dperf),
+		.feature_index = FME_FEATURE_ID_GLOBAL_DPERF,
+		.revision_id = FME_GLOBAL_DPERF_REVISION
+	},
+	{
+		.name = FME_FEATURE_QSPI_FLASH,
+		.resource_size = ALTERA_ASMIP2_RESOURCE_SIZE,
+		.feature_index = FME_FEATURE_ID_QSPI_FLASH,
+		.revision_id = FME_QSPI_REVISION
 	}
 };
 
@@ -640,13 +663,11 @@ static struct feature_info port_features[] = {
 		.feature_index = PORT_FEATURE_ID_UMSG,
 		.revision_id = PORT_UMSG_REVISION
 	},
-	/* SAS V0.8 didn't cover the port sub-feature PR, */
-	/* But the FEATURE ID 0x12 still there. Waiting for SAS update */
 	{
-		.name = PORT_FEATURE_PR,
-		.resource_size = 0,
-		.feature_index = PORT_FEATURE_ID_PR,
-		.revision_id = PORT_PR_REVISION
+		.name = PORT_FEATURE_UINT,
+		.resource_size = sizeof(struct feature_port_uint),
+		.feature_index = PORT_FEATURE_ID_UINT,
+		.revision_id = PORT_UINT_REVISION
 	},
 	{
 		.name = PORT_FEATURE_STP,
@@ -675,15 +696,15 @@ create_feature_instance(struct build_feature_devs_info *binfo,
 		return -EINVAL;
 
 	if (finfo->revision_id != SKIP_REVISION_CHECK
-		&& hdr->revision != finfo->revision_id) {
-		dev_err(&binfo->pdev->dev,
+		&& hdr->revision > finfo->revision_id) {
+		dev_dbg(&binfo->pdev->dev,
 		"feature %s revision :default:%x, now at:%x, mis-match.\n",
 		finfo->name, finfo->revision_id, hdr->revision);
 	}
 
-	build_info_add_sub_feature(binfo, finfo->feature_index, finfo->name,
-				   finfo->resource_size, start);
-	return 0;
+	return build_info_add_sub_feature(binfo, finfo->feature_index,
+			finfo->name, finfo->resource_size, start,
+			finfo->vec_start, finfo->vec_cnt);
 }
 
 static int parse_feature_fme(struct build_feature_devs_info *binfo,
@@ -706,6 +727,47 @@ static int parse_feature_fme(struct build_feature_devs_info *binfo,
 				       &fme_features[FME_FEATURE_ID_HEADER]);
 }
 
+static void parse_feature_irqs(struct build_feature_devs_info *binfo,
+			       void __iomem *start, struct feature_info *finfo)
+{
+	finfo->vec_start = 0;
+	finfo->vec_cnt = 0;
+
+	if (!strcmp(finfo->name, PORT_FEATURE_UINT)) {
+		struct feature_port_uint *port_uint = start;
+		struct feature_port_uint_cap uint_cap;
+
+		uint_cap.csr = readq(&port_uint->capability);
+		if (uint_cap.intr_num) {
+			finfo->vec_start = uint_cap.first_vec_num;
+			finfo->vec_cnt = uint_cap.intr_num;
+		} else
+			dev_dbg(&binfo->pdev->dev, "UAFU doesn't support interrupt\n");
+
+	} else if (!strcmp(finfo->name, PORT_FEATURE_ERR)) {
+		struct feature_port_error *port_err = start;
+		struct feature_port_err_capability port_err_cap;
+
+		port_err_cap.csr = readq(&port_err->error_capability);
+		if (port_err_cap.support_intr) {
+			finfo->vec_start = port_err_cap.intr_vector_num;
+			finfo->vec_cnt = 1;
+		} else
+			dev_dbg(&binfo->pdev->dev, "Port error doesn't support interrupt\n");
+
+	} else if (!strcmp(finfo->name, FME_FEATURE_GLOBAL_ERR)) {
+		struct feature_fme_err *fme_err = start;
+		struct feature_fme_error_capability fme_err_cap;
+
+		fme_err_cap.csr = readq(&fme_err->fme_err_capability);
+		if (fme_err_cap.support_intr) {
+			finfo->vec_start = fme_err_cap.intr_vector_num;
+			finfo->vec_cnt = 1;
+		} else
+			dev_dbg(&binfo->pdev->dev, "FME error doesn't support interrupt\n");
+	}
+}
+
 static int parse_feature_fme_private(struct build_feature_devs_info *binfo,
 				     struct feature_header *hdr)
 {
@@ -718,6 +780,8 @@ static int parse_feature_fme_private(struct build_feature_devs_info *binfo,
 			 header.id);
 		return 0;
 	}
+
+	parse_feature_irqs(binfo, hdr, &fme_features[header.id]);
 
 	check_features_header(binfo->pdev, hdr, FPGA_DEVT_FME, header.id);
 
@@ -778,6 +842,8 @@ static int parse_feature_port_private(struct build_feature_devs_info *binfo,
 		return 0;
 	}
 
+	parse_feature_irqs(binfo, hdr, &port_features[id]);
+
 	check_features_header(binfo->pdev, hdr, FPGA_DEVT_PORT, id);
 
 	return create_feature_instance(binfo, hdr, &port_features[id]);
@@ -817,30 +883,58 @@ static int parse_feature_afus(struct build_feature_devs_info *binfo,
 		afu_hdr = (struct feature_afu_header *) (hdr + 1);
 		header.csr = readq(&afu_hdr->csr);
 
-		if (feature_is_fme(afu_hdr)) {
-			ret = parse_feature_fme(binfo, hdr);
-			check_features_header(binfo->pdev,
-				hdr, FPGA_DEVT_FME, 0);
-			binfo->pfme_hdr = hdr;
-			if (ret)
-				return ret;
-		} else if (feature_is_port(afu_hdr)) {
-			ret = parse_feature_port(binfo, hdr);
-			check_features_header(binfo->pdev,
-				hdr, FPGA_DEVT_PORT, 0);
-			enable_port_uafu(binfo, hdr);
-			if (ret)
-				return ret;
-		} else if (feature_is_UAFU(binfo)) {
+		if (feature_is_UAFU(binfo))
 			ret = parse_feature_port_uafu(binfo, hdr);
 			if (ret)
 				return ret;
-		} else
-			dev_info(&binfo->pdev->dev, "AFU GUID %pUl is not supported yet.\n",
-				 afu_hdr->guid.b);
 
 		if (!header.next_afu)
 			break;
+	}
+
+	return 0;
+}
+
+static int parse_feature_fiu(struct build_feature_devs_info *binfo,
+			     struct feature_header *hdr)
+{
+	struct feature_header header;
+	struct feature_fiu_header *fiu_hdr, fiu_header;
+	void __iomem *start = hdr;
+	int ret;
+
+	header.csr = readq(hdr);
+
+	switch (header.id) {
+	case FEATURE_FIU_ID_FME:
+		ret = parse_feature_fme(binfo, hdr);
+		check_features_header(binfo->pdev, hdr, FPGA_DEVT_FME, 0);
+		binfo->pfme_hdr = hdr;
+		if (ret)
+			return ret;
+		break;
+	case FEATURE_FIU_ID_PORT:
+		ret = parse_feature_port(binfo, hdr);
+		check_features_header(binfo->pdev, hdr, FPGA_DEVT_PORT, 0);
+		enable_port_uafu(binfo, hdr);
+		if (ret)
+			return ret;
+
+		/* Check Port FIU's next_afu pointer to User AFU DFH */
+		fiu_hdr = (struct feature_fiu_header *) (hdr + 1);
+		fiu_header.csr = readq(&fiu_hdr->csr);
+
+		if (fiu_header.next_afu) {
+			start += fiu_header.next_afu;
+			ret = parse_feature_afus(binfo, start);
+			if (ret)
+				return ret;
+		} else
+			dev_dbg(&binfo->pdev->dev, "No AFUs detected on Port\n");
+		break;
+	default:
+		dev_info(&binfo->pdev->dev, "FIU TYPE %d is not supported yet.\n",
+			 header.id);
 	}
 
 	return 0;
@@ -886,6 +980,9 @@ static int parse_feature(struct build_feature_devs_info *binfo,
 	case FEATURE_TYPE_PRIVATE:
 		ret = parse_feature_private(binfo, hdr);
 		break;
+	case FEATURE_TYPE_FIU:
+		ret = parse_feature_fiu(binfo, hdr);
+		break;
 	default:
 		dev_info(&binfo->pdev->dev,
 			 "Feature Type %x is not supported.\n", hdr->type);
@@ -914,7 +1011,7 @@ parse_feature_list(struct build_feature_devs_info *binfo, void __iomem *start)
 			break;
 
 		header.csr = readq(hdr);
-		if (!header.next_header_offset)
+		if (header.eol || !header.next_header_offset)
 			break;
 	}
 
@@ -1065,17 +1162,21 @@ free_binfo_exit:
 }
 
 /* PCI Device ID */
-#define PCIe_DEVICE_ID_RCiEP0_INTG_XEON     0xBCC0
-#define PCIe_DEVICE_ID_RCiEP0_DISCRETE      0x09C4
+#define PCIe_DEVICE_ID_RCiEP0_MCP    0xBCBD
+#define PCIe_DEVICE_ID_RCiEP0_SKX_P  0xBCC0
+#define PCIe_DEVICE_ID_RCiEP0_DCP    0x09C4
 /* VF Device */
-#define PCIe_DEVICE_ID_VF_INTG_XEON         0xBCC1
-#define PCIe_DEVICE_ID_VF_DISCRETE          0x09C5
+#define PCIe_DEVICE_ID_VF_MCP        0xBCBF
+#define PCIe_DEVICE_ID_VF_SKX_P      0xBCC1
+#define PCIe_DEVICE_ID_VF_DCP        0x09C5
 
 static struct pci_device_id cci_pcie_id_tbl[] = {
-	{PCI_DEVICE(PCI_VENDOR_ID_INTEL, PCIe_DEVICE_ID_RCiEP0_INTG_XEON),},
-	{PCI_DEVICE(PCI_VENDOR_ID_INTEL, PCIe_DEVICE_ID_VF_INTG_XEON),},
-	{PCI_DEVICE(PCI_VENDOR_ID_INTEL, PCIe_DEVICE_ID_RCiEP0_DISCRETE),},
-	{PCI_DEVICE(PCI_VENDOR_ID_INTEL, PCIe_DEVICE_ID_VF_DISCRETE),},
+	{PCI_DEVICE(PCI_VENDOR_ID_INTEL, PCIe_DEVICE_ID_RCiEP0_MCP),},
+	{PCI_DEVICE(PCI_VENDOR_ID_INTEL, PCIe_DEVICE_ID_VF_MCP),},
+	{PCI_DEVICE(PCI_VENDOR_ID_INTEL, PCIe_DEVICE_ID_RCiEP0_SKX_P),},
+	{PCI_DEVICE(PCI_VENDOR_ID_INTEL, PCIe_DEVICE_ID_VF_SKX_P),},
+	{PCI_DEVICE(PCI_VENDOR_ID_INTEL, PCIe_DEVICE_ID_RCiEP0_DCP),},
+	{PCI_DEVICE(PCI_VENDOR_ID_INTEL, PCIe_DEVICE_ID_VF_DCP),},
 	{0,}
 };
 MODULE_DEVICE_TABLE(pci, cci_pcie_id_tbl);
@@ -1104,6 +1205,7 @@ static int cci_pci_sriov_configure(struct pci_dev *pcidev, int num_vfs)
 	int vf_ports = 0;
 	struct device *fme_dev;
 	struct cci_drvdata *drvdata = dev_get_drvdata(&pcidev->dev);
+	struct list_head *port_list = &drvdata->port_dev_list;
 	struct feature_platform_data *pdata;
 
 	mutex_lock(&drvdata->lock);
@@ -1118,13 +1220,8 @@ static int cci_pci_sriov_configure(struct pci_dev *pcidev, int num_vfs)
 
 	if (!num_vfs)
 		pci_disable_sriov(pcidev);
-	else {
-		ret = pci_enable_sriov(pcidev, num_vfs);
-		if (ret)
-			goto unlock_exit;
-	}
 
-	list_for_each_entry(pdata, &drvdata->port_dev_list, node) {
+	list_for_each_entry(pdata, port_list, node) {
 		int id = fpga_port_id(pdata->dev);
 
 		if (device_is_registered(&pdata->dev->dev))
@@ -1142,10 +1239,82 @@ static int cci_pci_sriov_configure(struct pci_dev *pcidev, int num_vfs)
 			break;
 	}
 
+	if (num_vfs) {
+		ret = pci_enable_sriov(pcidev, num_vfs);
+		if (ret) {
+			list_for_each_entry(pdata, port_list, node) {
+				int id = fpga_port_id(pdata->dev);
+
+				if (device_is_registered(&pdata->dev->dev))
+					continue;
+
+				port_config_vf(fme_dev, id, false);
+			}
+
+			goto unlock_exit;
+		}
+	}
+
 	ret = num_vfs;
 unlock_exit:
 	mutex_unlock(&drvdata->lock);
 	return ret;
+}
+
+static int cci_pci_alloc_irq(struct pci_dev *pcidev)
+{
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,8,0)
+	struct cci_drvdata *drvdata = dev_get_drvdata(&pcidev->dev);
+	int i = 0;
+#endif
+	int nvec = pci_msix_vec_count(pcidev);
+	int ret = 0;
+
+	if (nvec <= 0) {
+		dev_dbg(&pcidev->dev, "fpga interrupt not supported\n");
+		return 0;
+	}
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,8,0)
+	drvdata->msix_entries = devm_kmalloc(&pcidev->dev,
+					     (sizeof(struct msix_entry) * nvec),
+					     GFP_KERNEL);
+	if (!drvdata->msix_entries)
+		return -ENOMEM;
+
+	for (i = 0; i < nvec; i++) {
+		drvdata->msix_entries[i].entry = i;
+		drvdata->msix_entries[i].vector = 0;
+	}
+
+	ret = pci_enable_msix_exact(pcidev, drvdata->msix_entries, nvec);
+	if (ret) {
+		devm_kfree(&pcidev->dev, drvdata->msix_entries);
+		drvdata->msix_entries = NULL;
+		return ret;
+	}
+#else
+	ret = pci_alloc_irq_vectors(pcidev, nvec, nvec, PCI_IRQ_MSIX);
+	if (ret < 0)
+		return ret;
+#endif
+
+	return 0;
+}
+
+static void cci_pci_free_irq(struct pci_dev *pcidev)
+{
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,8,0)
+	struct cci_drvdata *drvdata = dev_get_drvdata(&pcidev->dev);
+
+	if (drvdata->msix_entries) {
+		pci_disable_msix(pcidev);
+		devm_kfree(&pcidev->dev, drvdata->msix_entries);
+		drvdata->msix_entries = NULL;
+	}
+#else
+	pci_free_irq_vectors(pcidev);
+#endif
 }
 
 static
@@ -1186,12 +1355,18 @@ int cci_pci_probe(struct pci_dev *pcidev, const struct pci_device_id *pcidevid)
 	if (ret)
 		goto release_region_exit;
 
-	ret = cci_pci_create_feature_devs(pcidev);
+	ret = cci_pci_alloc_irq(pcidev);
 	if (ret)
 		goto destroy_drvdata_exit;
 
+	ret = cci_pci_create_feature_devs(pcidev);
+	if (ret)
+		goto free_irq_exit;
+
 	return 0;
 
+free_irq_exit:
+	cci_pci_free_irq(pcidev);
 destroy_drvdata_exit:
 	destroy_drvdata(pcidev);
 release_region_exit:
@@ -1214,6 +1389,7 @@ void cci_pci_remove(struct pci_dev *pcidev)
 
 	pci_disable_pcie_error_reporting(pcidev);
 
+	cci_pci_free_irq(pcidev);
 	destroy_drvdata(pcidev);
 	pci_release_regions(pcidev);
 	pci_disable_device(pcidev);

@@ -43,8 +43,10 @@ struct fpga_afu_dma_region {
 
 struct fpga_afu {
 	u64 region_cur_offset;
+	u32 capability;
 	int num_regions;
 	u8 num_umsgs;
+	u8 num_uafu_irqs;
 	struct list_head regions;
 	struct rb_root dma_regions;
 

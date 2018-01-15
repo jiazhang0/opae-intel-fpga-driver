@@ -23,6 +23,11 @@
 #include <linux/sysfs.h>
 #include <linux/idr.h>
 #include <linux/sched.h> /* current->mm in pre-4.0 kernels */
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,11,0)
+#include <linux/sched/signal.h> /* rlimit function for 4.11 and later */
+#endif
+
 #include <linux/uuid.h>
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(3,12,0)

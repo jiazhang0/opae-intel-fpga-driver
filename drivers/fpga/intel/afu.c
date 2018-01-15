@@ -69,6 +69,114 @@ ltr_show(struct device *dev, struct device_attribute *attr, char *buf)
 static DEVICE_ATTR_RO(ltr);
 
 static ssize_t
+ap1_event_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct feature_platform_data *pdata = dev_get_platdata(dev);
+	struct feature_port_header *port_hdr;
+	struct feature_port_status status;
+
+	port_hdr = get_feature_ioaddr_by_index(dev, PORT_FEATURE_ID_HEADER);
+
+	mutex_lock(&pdata->lock);
+	status.csr = readq(&port_hdr->status);
+	mutex_unlock(&pdata->lock);
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n", status.ap1_event);
+}
+
+static ssize_t
+ap1_event_store(struct device *dev, struct device_attribute *attr,
+		const char *buf, size_t count)
+{
+	struct feature_platform_data *pdata = dev_get_platdata(dev);
+	struct feature_port_header *port_hdr;
+	struct feature_port_status status;
+	u8 ap1_event;
+	int err;
+
+	err = kstrtou8(buf, 0, &ap1_event);
+	if (err)
+		return err;
+
+	if (ap1_event != 1)
+		return -EINVAL;
+
+	port_hdr = get_feature_ioaddr_by_index(dev, PORT_FEATURE_ID_HEADER);
+
+	mutex_lock(&pdata->lock);
+	status.csr = readq(&port_hdr->status);
+	status.ap1_event = ap1_event;
+	writeq(status.csr, &port_hdr->status);
+	mutex_unlock(&pdata->lock);
+
+	return count;
+}
+static DEVICE_ATTR_RW(ap1_event);
+
+static ssize_t
+ap2_event_show(struct device *dev, struct device_attribute *attr,
+	       char *buf)
+{
+	struct feature_platform_data *pdata = dev_get_platdata(dev);
+	struct feature_port_header *port_hdr;
+	struct feature_port_status status;
+
+	port_hdr = get_feature_ioaddr_by_index(dev, PORT_FEATURE_ID_HEADER);
+
+	mutex_lock(&pdata->lock);
+	status.csr = readq(&port_hdr->status);
+	mutex_unlock(&pdata->lock);
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n", status.ap2_event);
+}
+
+static ssize_t
+ap2_event_store(struct device *dev, struct device_attribute *attr,
+		const char *buf, size_t count)
+{
+	struct feature_platform_data *pdata = dev_get_platdata(dev);
+	struct feature_port_header *port_hdr;
+	struct feature_port_status status;
+	u8 ap2_event;
+	int err;
+
+	err = kstrtou8(buf, 0, &ap2_event);
+	if (err)
+		return err;
+
+	if (ap2_event != 1)
+		return -EINVAL;
+
+	port_hdr = get_feature_ioaddr_by_index(dev, PORT_FEATURE_ID_HEADER);
+
+	mutex_lock(&pdata->lock);
+	status.csr = readq(&port_hdr->status);
+	status.ap2_event = ap2_event;
+	writeq(status.csr, &port_hdr->status);
+	mutex_unlock(&pdata->lock);
+
+	return count;
+}
+static DEVICE_ATTR_RW(ap2_event);
+
+static ssize_t
+power_state_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct feature_platform_data *pdata = dev_get_platdata(dev);
+	struct feature_port_header *port_hdr;
+	struct feature_port_status status;
+
+	port_hdr = get_feature_ioaddr_by_index(dev, PORT_FEATURE_ID_HEADER);
+
+	mutex_lock(&pdata->lock);
+	status.csr = readq(&port_hdr->status);
+	mutex_unlock(&pdata->lock);
+
+	return scnprintf(buf, PAGE_SIZE, "0x%x\n", status.power_state);
+}
+static DEVICE_ATTR_RO(power_state);
+
+static ssize_t
 userclk_freqcmd_show(struct device *dev, struct device_attribute *attr,
 		     char *buf)
 {
@@ -182,6 +290,9 @@ static const struct attribute *port_hdr_attrs[] = {
 	&dev_attr_revision.attr,
 	&dev_attr_id.attr,
 	&dev_attr_ltr.attr,
+	&dev_attr_ap1_event.attr,
+	&dev_attr_ap2_event.attr,
+	&dev_attr_power_state.attr,
 	&dev_attr_userclk_freqcmd.attr,
 	&dev_attr_userclk_freqcntrcmd.attr,
 	&dev_attr_userclk_freqsts.attr,
@@ -245,6 +356,11 @@ afu_id_show(struct device *dev, struct device_attribute *attr, char *buf)
 	u64 guidh;
 
 	mutex_lock(&pdata->lock);
+	if (pdata->disable_count) {
+		mutex_unlock(&pdata->lock);
+		return -EBUSY;
+	}
+
 	guidl = readq(&port_hdr->afu_header.guid.b[0]);
 	guidh = readq(&port_hdr->afu_header.guid.b[8]);
 	mutex_unlock(&pdata->lock);
@@ -281,6 +397,47 @@ static void port_afu_uinit(struct platform_device *pdev,
 	dev_dbg(&pdev->dev, "PORT AFU UInit.\n");
 
 	sysfs_remove_files(&pdev->dev.kobj, port_uafu_attrs);
+}
+
+static long port_afu_set_irq(struct platform_device *pdev,
+			struct feature *feature, unsigned long arg)
+{
+	struct feature_platform_data *pdata = dev_get_platdata(&pdev->dev);
+	struct fpga_port_uafu_irq_set hdr;
+	struct fpga_afu *afu;
+	unsigned long minsz;
+	int32_t *fds = NULL;
+	long ret = 0;
+
+	minsz = offsetofend(struct fpga_port_uafu_irq_set, count);
+
+	if (copy_from_user(&hdr, (void __user *)arg, minsz))
+		return -EFAULT;
+
+	if (hdr.argsz < minsz || hdr.flags)
+		return -EINVAL;
+
+	if ((hdr.start + hdr.count > feature->ctx_num) ||
+		(hdr.start + hdr.count < hdr.start) || !hdr.count)
+		return -EINVAL;
+
+	fds = memdup_user((void __user *)(arg + minsz),
+			  hdr.count * sizeof(int32_t));
+	if (IS_ERR(fds))
+		return PTR_ERR(fds);
+
+	mutex_lock(&pdata->lock);
+	afu = fpga_pdata_get_private(pdata);
+	if (!(afu->capability & FPGA_PORT_CAP_UAFU_IRQ)) {
+		mutex_unlock(&pdata->lock);
+		kfree(fds);
+		return -ENODEV;
+	}
+	ret = fpga_msix_set_block(feature, hdr.start, hdr.count, fds);
+	mutex_unlock(&pdata->lock);
+
+	kfree(fds);
+	return ret;
 }
 
 struct feature_ops port_afu_ops = {
@@ -612,6 +769,51 @@ struct feature_ops port_stp_ops = {
 	.test = port_stp_test,
 };
 
+static int port_uint_init(struct platform_device *pdev, struct feature *feature)
+{
+	struct feature_platform_data *pdata = dev_get_platdata(&pdev->dev);
+	struct fpga_afu *afu;
+
+	mutex_lock(&pdata->lock);
+	afu = fpga_pdata_get_private(pdata);
+	if (feature->ctx_num) {
+		afu->capability |= FPGA_PORT_CAP_UAFU_IRQ;
+		afu->num_uafu_irqs = feature->ctx_num;
+	}
+	mutex_unlock(&pdata->lock);
+
+	return 0;
+}
+
+static void port_uint_uinit(struct platform_device *pdev,
+			    struct feature *feature)
+{
+	dev_dbg(&pdev->dev, "PORT UINT UInit.\n");
+}
+
+static long
+port_uint_ioctl(struct platform_device *pdev, struct feature *feature,
+		unsigned int cmd, unsigned long arg)
+{
+	long ret;
+
+	switch (cmd) {
+	case FPGA_PORT_UAFU_SET_IRQ:
+		ret = port_afu_set_irq(pdev, feature, arg);
+		break;
+	default:
+		dev_dbg(&pdev->dev, "%x cmd not handled", cmd);
+		return -ENODEV;
+	}
+	return ret;
+}
+
+struct feature_ops port_uint_ops = {
+	.init = port_uint_init,
+	.uinit = port_uint_uinit,
+	.ioctl = port_uint_ioctl,
+};
+
 static struct feature_driver port_feature_drvs[] = {
 	{
 		.name = PORT_FEATURE_HEADER,
@@ -628,6 +830,10 @@ static struct feature_driver port_feature_drvs[] = {
 	{
 		.name = PORT_FEATURE_UMSG,
 		.ops = &port_umsg_ops,
+	},
+	{
+		.name = PORT_FEATURE_UINT,
+		.ops = &port_uint_ops,
 	},
 	{
 		.name = PORT_FEATURE_STP,
@@ -672,6 +878,10 @@ static int afu_release(struct inode *inode, struct file *filp)
 	__feature_dev_use_end(pdata);
 
 	if (!pdata->open_count) {
+		fpga_msix_set_block(&pdata->features[PORT_FEATURE_ID_ERROR], 0,
+			pdata->features[PORT_FEATURE_ID_ERROR].ctx_num, NULL);
+		fpga_msix_set_block(&pdata->features[PORT_FEATURE_ID_UINT], 0,
+			pdata->features[PORT_FEATURE_ID_UINT].ctx_num, NULL);
 		afu_port_umsg_halt(&pdata->dev->dev);
 		__fpga_port_reset(pdev);
 		afu_dma_region_destroy(pdata);
@@ -694,7 +904,7 @@ afu_ioctl_get_info(struct feature_platform_data *pdata, void __user *arg)
 	struct fpga_afu *afu;
 	unsigned long minsz;
 
-	minsz = offsetofend(struct fpga_port_info, num_umsgs);
+	minsz = offsetofend(struct fpga_port_info, num_uafu_irqs);
 
 	if (copy_from_user(&info, arg, minsz))
 		return -EFAULT;
@@ -705,8 +915,10 @@ afu_ioctl_get_info(struct feature_platform_data *pdata, void __user *arg)
 	mutex_lock(&pdata->lock);
 	afu = fpga_pdata_get_private(pdata);
 	info.flags = 0;
+	info.capability = afu->capability;
 	info.num_regions = afu->num_regions;
 	info.num_umsgs = afu->num_umsgs;
+	info.num_uafu_irqs = afu->num_uafu_irqs;
 	mutex_unlock(&pdata->lock);
 
 	if (copy_to_user(arg, &info, sizeof(info)))

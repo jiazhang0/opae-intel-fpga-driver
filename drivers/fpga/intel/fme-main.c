@@ -29,6 +29,7 @@
 
 #include "backport.h"
 #include <linux/fpga/fpga-mgr_mod.h>
+#include <linux/mtd/altera-asmip2.h>
 
 #include "feature-dev.h"
 #include "fme.h"
@@ -622,6 +623,38 @@ static ssize_t rtl_show(struct device *dev,
 
 static DEVICE_ATTR_RO(rtl);
 
+static ssize_t xeon_limit_show(struct device *dev,
+	struct device_attribute *attr, char *buf)
+{
+	struct feature_fme_power *fme_power
+		= get_feature_ioaddr_by_index(dev, FME_FEATURE_ID_POWER_MGMT);
+	struct feature_fme_pm_xeon_limit xeon_limit;
+
+	xeon_limit.csr = readq(&fme_power->xeon_limit);
+
+	if (!xeon_limit.enable)
+		xeon_limit.pwr_limit = 0;
+
+	return scnprintf(buf, PAGE_SIZE, "%u\n", xeon_limit.pwr_limit);
+}
+static DEVICE_ATTR_RO(xeon_limit);
+
+static ssize_t fpga_limit_show(struct device *dev,
+	struct device_attribute *attr, char *buf)
+{
+	struct feature_fme_power *fme_power
+		= get_feature_ioaddr_by_index(dev, FME_FEATURE_ID_POWER_MGMT);
+	struct feature_fme_pm_fpga_limit fpga_limit;
+
+	fpga_limit.csr = readq(&fme_power->fpga_limit);
+
+	if (!fpga_limit.enable)
+		fpga_limit.pwr_limit = 0;
+
+	return scnprintf(buf, PAGE_SIZE, "%u\n", fpga_limit.pwr_limit);
+}
+static DEVICE_ATTR_RO(fpga_limit);
+
 static struct attribute *power_mgmt_attrs[] = {
 	&dev_attr_pwr_revision.attr,
 	&dev_attr_consumed.attr,
@@ -629,6 +662,8 @@ static struct attribute *power_mgmt_attrs[] = {
 	&dev_attr_pwr_threshold2.attr,
 	&dev_attr_threshold1_status.attr,
 	&dev_attr_threshold2_status.attr,
+	&dev_attr_xeon_limit.attr,
+	&dev_attr_fpga_limit.attr,
 	&dev_attr_rtl.attr,
 	NULL,
 };
@@ -661,6 +696,135 @@ struct feature_ops power_mgmt_ops = {
 	.uinit = power_mgmt_uinit,
 };
 
+static int hssi_mgmt_init(struct platform_device *pdev, struct feature *feature)
+{
+	dev_dbg(&pdev->dev, "FME HSSI Init.\n");
+	return 0;
+}
+
+static void hssi_mgmt_uinit(struct platform_device *pdev,
+				struct feature *feature)
+{
+	dev_dbg(&pdev->dev, "FME HSSI UInit.\n");
+}
+
+struct feature_ops hssi_mgmt_ops = {
+	.init = hssi_mgmt_init,
+	.uinit = hssi_mgmt_uinit,
+};
+
+#define FLASH_CAPABILITY_OFT 8
+
+static int qspi_flash_init(struct platform_device *pdev,
+			   struct feature *feature)
+{
+	u64 reg;
+	struct altera_asmip2_plat_data qdata;
+	struct platform_device *cdev;
+	int ret = 0;
+
+	reg = readq(feature->ioaddr + FLASH_CAPABILITY_OFT);
+	dev_info(&pdev->dev, "%s %s %d 0x%llx 0x%x 0x%x\n",
+		 __func__, ALTERA_ASMIP2_DRV_NAME, feature->resource_index,
+		 reg, readl(feature->ioaddr + FLASH_CAPABILITY_OFT),
+		 readl(feature->ioaddr + FLASH_CAPABILITY_OFT + 4));
+
+	cdev = platform_device_alloc(ALTERA_ASMIP2_DRV_NAME,
+				     PLATFORM_DEVID_AUTO);
+
+	if (!cdev) {
+		dev_err(&pdev->dev, "platform_device_alloc failed in %s\n",
+			__func__);
+		return -ENOMEM;
+	}
+
+	cdev->dev.parent = &pdev->dev;
+
+	memset(&qdata, 0, sizeof(qdata));
+	qdata.csr_base = feature->ioaddr + FLASH_CAPABILITY_OFT;
+	qdata.num_chip_sel = 1;
+
+	ret = platform_device_add_data(cdev, &qdata, sizeof(qdata));
+	if (ret) {
+		dev_err(&pdev->dev, "platform_device_add_data in %s\n",
+			__func__);
+		goto error;
+	}
+
+	ret = platform_device_add(cdev);
+	if (ret) {
+		dev_err(&pdev->dev, "platform_device_add failed with %d\n",
+			ret);
+		goto error;
+	}
+
+	return ret;
+
+error:
+	platform_device_put(cdev);
+	return ret;
+}
+
+struct feature_platform_search {
+	const char *drv_name;
+	int name_len;
+	struct feature *feature;
+};
+
+static int qspi_match(struct device *dev, void *data)
+{
+	struct feature_platform_search *src =
+		(struct feature_platform_search *)data;
+	struct altera_asmip2_plat_data *qdata;
+
+	if (strncmp(dev_name(dev), src->drv_name, src->name_len))
+		return 0;
+
+	qdata = dev_get_platdata(dev);
+
+	if (qdata &&
+	    (qdata->csr_base == (src->feature->ioaddr + FLASH_CAPABILITY_OFT)))
+		return 1;
+	else
+		return 0;
+}
+
+static void qspi_flash_uinit(struct platform_device *pdev,
+			     struct feature *feature)
+{
+	struct device *parent = &pdev->dev;
+	struct feature_platform_search src;
+	struct device *dev;
+	struct platform_device *cdev;
+
+	src.drv_name = ALTERA_ASMIP2_DRV_NAME;
+	src.name_len = strlen(ALTERA_ASMIP2_DRV_NAME);
+	src.feature = feature;
+
+	dev = device_find_child(parent, &src, qspi_match);
+
+	if (!dev) {
+		dev_err(&pdev->dev, "%s NOT found\n", ALTERA_ASMIP2_DRV_NAME);
+		return;
+	}
+
+	dev_info(&pdev->dev, "%s found %s\n", __func__, ALTERA_ASMIP2_DRV_NAME);
+
+	cdev = to_platform_device(dev);
+
+	if (!cdev) {
+		dev_err(&pdev->dev, "no platform container\n");
+		return;
+	}
+
+	platform_device_unregister(cdev);
+}
+
+struct feature_ops qspi_flash_ops = {
+	.init = qspi_flash_init,
+	.uinit = qspi_flash_uinit,
+};
+
 static struct feature_driver fme_feature_drvs[] = {
 	{
 		.name = FME_FEATURE_HEADER,
@@ -683,8 +847,20 @@ static struct feature_driver fme_feature_drvs[] = {
 		.ops = &pr_mgmt_ops,
 	},
 	{
-		.name = FME_FEATURE_GLOBAL_PERF,
-		.ops = &global_perf_ops,
+		.name = FME_FEATURE_GLOBAL_IPERF,
+		.ops = &global_iperf_ops,
+	},
+	{
+		.name = FME_FEATURE_HSSI_ETH,
+		.ops = &hssi_mgmt_ops,
+	},
+	{
+		.name = FME_FEATURE_GLOBAL_DPERF,
+		.ops = &global_dperf_ops,
+	},
+	{
+		.name = FME_FEATURE_QSPI_FLASH,
+		.ops = &qspi_flash_ops,
 	},
 	{
 		.ops = NULL,
@@ -695,6 +871,33 @@ static long fme_ioctl_check_extension(struct feature_platform_data *pdata,
 				     unsigned long arg)
 {
 	/* No extension support for now */
+	return 0;
+}
+
+static long
+fme_ioctl_get_info(struct feature_platform_data *pdata, void __user *arg)
+{
+	struct fpga_fme_info info;
+	struct fpga_fme *fme;
+	unsigned long minsz;
+
+	minsz = offsetofend(struct fpga_fme_info, capability);
+
+	if (copy_from_user(&info, arg, minsz))
+		return -EFAULT;
+
+	if (info.argsz < minsz)
+		return -EINVAL;
+
+	mutex_lock(&pdata->lock);
+	fme = fpga_pdata_get_private(pdata);
+	info.flags = 0;
+	info.capability = fme->capability;
+	mutex_unlock(&pdata->lock);
+
+	if (copy_to_user(arg, &info, sizeof(info)))
+		return -EFAULT;
+
 	return 0;
 }
 
@@ -782,7 +985,15 @@ static int fme_release(struct inode *inode, struct file *filp)
 	struct platform_device *pdev = pdata->dev;
 
 	dev_dbg(&pdev->dev, "Device File Release\n");
-	feature_dev_use_end(pdata);
+	mutex_lock(&pdata->lock);
+	__feature_dev_use_end(pdata);
+
+	if (!pdata->open_count)
+		fpga_msix_set_block(&pdata->features[FME_FEATURE_ID_GLOBAL_ERR],
+			0, pdata->features[FME_FEATURE_ID_GLOBAL_ERR].ctx_num,
+			NULL);
+	mutex_unlock(&pdata->lock);
+
 	return 0;
 }
 
@@ -800,6 +1011,8 @@ static long fme_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		return FPGA_API_VERSION;
 	case FPGA_CHECK_EXTENSION:
 		return fme_ioctl_check_extension(pdata, arg);
+	case FPGA_FME_GET_INFO:
+		return fme_ioctl_get_info(pdata, (void __user *)arg);
 	case FPGA_FME_PORT_RELEASE:
 		return fme_ioctl_release_port(pdata, (void __user *)arg);
 	case FPGA_FME_PORT_ASSIGN:

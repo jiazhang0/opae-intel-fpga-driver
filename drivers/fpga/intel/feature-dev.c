@@ -20,13 +20,18 @@
 
 void feature_platform_data_add(struct feature_platform_data *pdata,
 			       int index, const char *name,
-			       int resource_index, void __iomem *ioaddr)
+			       int resource_index, void __iomem *ioaddr,
+			       struct feature_irq_ctx *ctx,
+			       unsigned int ctx_num)
 {
 	WARN_ON(index >= pdata->num);
+	WARN_ON(ctx_num && !ctx);
 
 	pdata->features[index].name = name;
 	pdata->features[index].resource_index = resource_index;
 	pdata->features[index].ioaddr = ioaddr;
+	pdata->features[index].ctx = ctx;
+	pdata->features[index].ctx_num = ctx_num;
 }
 
 int feature_platform_data_size(int num)
@@ -286,3 +291,78 @@ int __fpga_port_disable(struct platform_device *pdev)
 	return 0;
 }
 EXPORT_SYMBOL_GPL(__fpga_port_disable);
+
+static irqreturn_t fpga_msix_handler(int irq, void *arg)
+{
+	struct eventfd_ctx *trigger = arg;
+
+	eventfd_signal(trigger, 1);
+	return IRQ_HANDLED;
+}
+
+static int fpga_set_vector_signal(struct feature *feature, int vector, int fd)
+{
+	struct eventfd_ctx *trigger;
+	int irq, ret;
+
+	if (vector < 0 || vector >= feature->ctx_num)
+		return -EINVAL;
+
+	irq = feature->ctx[vector].irq;
+
+	if (feature->ctx[vector].trigger) {
+		free_irq(irq, feature->ctx[vector].trigger);
+		kfree(feature->ctx[vector].name);
+		eventfd_ctx_put(feature->ctx[vector].trigger);
+		feature->ctx[vector].trigger = NULL;
+	}
+
+	if (fd < 0)
+		return 0;
+
+	feature->ctx[vector].name = kasprintf(GFP_KERNEL, "fpga-msix[%d](%s)",
+						vector, feature->name);
+	if (!feature->ctx[vector].name)
+		return -ENOMEM;
+
+	trigger = eventfd_ctx_fdget(fd);
+	if (IS_ERR(trigger)) {
+		kfree(feature->ctx[vector].name);
+		return PTR_ERR(trigger);
+	}
+
+	ret = request_irq(irq, fpga_msix_handler, 0, feature->ctx[vector].name,
+			  trigger);
+	if (ret) {
+		kfree(feature->ctx[vector].name);
+		eventfd_ctx_put(trigger);
+		return ret;
+	}
+
+	feature->ctx[vector].trigger = trigger;
+
+	return 0;
+}
+
+int fpga_msix_set_block(struct feature *feature, unsigned int start,
+			unsigned int count, int32_t *fds)
+{
+	int i, j, ret = 0;
+
+	if (start >= feature->ctx_num || start + count > feature->ctx_num)
+		return -EINVAL;
+
+	for (i = 0, j = start; i < count && !ret; i++, j++) {
+		int fd = fds ? fds[i] : -1;
+
+		ret = fpga_set_vector_signal(feature, j, fd);
+	}
+
+	if (ret) {
+		for (--j; j >= (int)start; j--)
+			fpga_set_vector_signal(feature, j, -1);
+	}
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(fpga_msix_set_block);

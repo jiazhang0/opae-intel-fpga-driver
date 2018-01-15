@@ -219,79 +219,35 @@ static ssize_t pcie1_errors_store(struct device *dev,
 
 static DEVICE_ATTR_RW(pcie1_errors);
 
-static ssize_t gbs_errors_show(struct device *dev,
+static ssize_t nonfatal_errors_show(struct device *dev,
 	struct device_attribute *attr, char *buf)
 {
 	struct feature_fme_err *fme_err
 		= get_feature_ioaddr_by_index(dev->parent,
 				FME_FEATURE_ID_GLOBAL_ERR);
-	struct feature_fme_ras_gerror ras_gerr;
+	struct feature_fme_ras_nonfaterror ras_nonfaterr;
 
-	ras_gerr.csr = readq(&fme_err->ras_gerr);
+	ras_nonfaterr.csr = readq(&fme_err->ras_nonfaterr);
 
-	return scnprintf(buf, PAGE_SIZE, "0x%llx\n", ras_gerr.csr);
+	return scnprintf(buf, PAGE_SIZE, "0x%llx\n", ras_nonfaterr.csr);
 }
 
-static DEVICE_ATTR_RO(gbs_errors);
+static DEVICE_ATTR_RO(nonfatal_errors);
 
-static ssize_t bbs_errors_show(struct device *dev,
+static ssize_t catfatal_errors_show(struct device *dev,
 	struct device_attribute *attr, char *buf)
 {
 	struct feature_fme_err *fme_err
 		= get_feature_ioaddr_by_index(dev->parent,
 				FME_FEATURE_ID_GLOBAL_ERR);
-	struct feature_fme_ras_berror ras_berr;
+	struct feature_fme_ras_catfaterror ras_catfaterr;
 
-	ras_berr.csr = readq(&fme_err->ras_berr);
+	ras_catfaterr.csr = readq(&fme_err->ras_catfaterr);
 
-	return scnprintf(buf, PAGE_SIZE, "0x%llx\n", ras_berr.csr);
+	return scnprintf(buf, PAGE_SIZE, "0x%llx\n", ras_catfaterr.csr);
 }
 
-static DEVICE_ATTR_RO(bbs_errors);
-
-static ssize_t warning_errors_show(struct device *dev,
-	struct device_attribute *attr, char *buf)
-{
-	struct feature_fme_err *fme_err
-		= get_feature_ioaddr_by_index(dev->parent,
-				FME_FEATURE_ID_GLOBAL_ERR);
-	struct feature_fme_ras_werror ras_werr;
-
-	ras_werr.csr = readq(&fme_err->ras_werr);
-
-	return scnprintf(buf, PAGE_SIZE, "0x%x\n", ras_werr.event_warn_err);
-}
-
-static ssize_t warning_errors_store(struct device *dev,
-	struct device_attribute *attr, const char *buf, size_t count)
-{
-	struct feature_platform_data *pdata = dev_get_platdata(dev->parent);
-	struct feature_fme_err *fme_err
-		= get_feature_ioaddr_by_index(dev->parent,
-				FME_FEATURE_ID_GLOBAL_ERR);
-	struct feature_fme_ras_werror ras_werr;
-	u64 val;
-
-	if (kstrtou64(buf, 0, &val))
-		return -EINVAL;
-
-	mutex_lock(&pdata->lock);
-	writeq(FME_RAS_WERROR_MASK, &fme_err->ras_werr_mask);
-
-	ras_werr.csr = readq(&fme_err->ras_werr);
-	if (val != ras_werr.csr)
-		count = -EBUSY;
-	else
-		writeq(ras_werr.csr & FME_RAS_WERROR_MASK,
-				&fme_err->ras_werr);
-
-	writeq(0UL, &fme_err->ras_werr_mask);
-	mutex_unlock(&pdata->lock);
-
-	return count;
-}
-
-static DEVICE_ATTR_RW(warning_errors);
+static DEVICE_ATTR_RO(catfatal_errors);
 
 static ssize_t inject_error_show(struct device *dev,
 	struct device_attribute *attr, char *buf)
@@ -359,9 +315,8 @@ static struct attribute *errors_attrs[] = {
 	&dev_attr_revision.attr,
 	&dev_attr_pcie0_errors.attr,
 	&dev_attr_pcie1_errors.attr,
-	&dev_attr_gbs_errors.attr,
-	&dev_attr_bbs_errors.attr,
-	&dev_attr_warning_errors.attr,
+	&dev_attr_nonfatal_errors.attr,
+	&dev_attr_catfatal_errors.attr,
 	&dev_attr_inject_error.attr,
 	NULL,
 };
@@ -385,9 +340,8 @@ static void fme_error_enable(struct platform_device *pdev)
 	writeq(FME_ERROR0_MASK_DEFAULT, &fme_err->fme_err_mask);
 	writeq(0UL, &fme_err->pcie0_err_mask);
 	writeq(0UL, &fme_err->pcie1_err_mask);
-	writeq(0UL, &fme_err->ras_gerr_mask);
-	writeq(0UL, &fme_err->ras_berr_mask);
-	writeq(0UL, &fme_err->ras_werr_mask);
+	writeq(0UL, &fme_err->ras_nonfat_mask);
+	writeq(0UL, &fme_err->ras_catfat_mask);
 }
 
 static int global_error_init(struct platform_device *pdev,
@@ -423,6 +377,8 @@ static int global_error_init(struct platform_device *pdev,
 	mutex_lock(&pdata->lock);
 	fme = fpga_pdata_get_private(pdata);
 	fme->dev_err = dev;
+	if (feature->ctx_num)
+		fme->capability |= FPGA_FME_CAP_ERR_IRQ;
 	mutex_unlock(&pdata->lock);
 
 	return ret;
@@ -442,7 +398,55 @@ static void global_error_uinit(struct platform_device *pdev,
 	mutex_unlock(&pdata->lock);
 }
 
+static long fme_err_set_irq(struct platform_device *pdev,
+			struct feature *feature, unsigned long arg)
+{
+	struct feature_platform_data *pdata = dev_get_platdata(&pdev->dev);
+	struct fpga_fme_err_irq_set hdr;
+	struct fpga_fme *fme;
+	unsigned long minsz;
+	long ret = 0;
+
+	minsz = offsetofend(struct fpga_fme_err_irq_set, evtfd);
+
+	if (copy_from_user(&hdr, (void __user *)arg, minsz))
+		return -EFAULT;
+
+	if (hdr.argsz < minsz || hdr.flags)
+		return -EINVAL;
+
+	mutex_lock(&pdata->lock);
+	fme = fpga_pdata_get_private(pdata);
+	if (!(fme->capability & FPGA_FME_CAP_ERR_IRQ)) {
+		mutex_unlock(&pdata->lock);
+		return -ENODEV;
+	}
+	ret = fpga_msix_set_block(feature, 0, 1, &hdr.evtfd);
+	mutex_unlock(&pdata->lock);
+
+	return ret;
+}
+
+static long
+global_error_ioctl(struct platform_device *pdev, struct feature *feature,
+		   unsigned int cmd, unsigned long arg)
+{
+	long ret;
+
+	switch (cmd) {
+	case FPGA_FME_ERR_SET_IRQ:
+		ret = fme_err_set_irq(pdev, feature, arg);
+		break;
+	default:
+		dev_dbg(&pdev->dev, "%x cmd not handled", cmd);
+		ret = -ENODEV;
+	}
+
+	return ret;
+}
+
 struct feature_ops global_error_ops = {
 	.init = global_error_init,
 	.uinit = global_error_uinit,
+	.ioctl = global_error_ioctl,
 };

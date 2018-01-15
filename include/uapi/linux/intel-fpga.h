@@ -26,10 +26,10 @@
 #define FPGA_API_VERSION 0
 
 #define INTEL_FPGA_DRIVER_VER_MAJOR  0
-#define INTEL_FPGA_DRIVER_VER_MINOR  9
+#define INTEL_FPGA_DRIVER_VER_MINOR  13
 #define INTEL_FPGA_DRIVER_VER_REV    0
 #define INTEL_FPGA_DRIVER_VER_BUILD  
-#define INTEL_FPGA_DRIVER_VERSION    "0.9.0"
+#define INTEL_FPGA_DRIVER_VERSION    "0.13.0"
 
 /*
  * The IOCTL interface for Intel FPGA is designed for extensibility by
@@ -87,8 +87,12 @@ struct fpga_port_info {
 	__u32 argsz;		/* Structure length */
 	/* Output */
 	__u32 flags;		/* Zero for now */
+	__u32 capability;	/* The capability of port device */
+#define FPGA_PORT_CAP_ERR_IRQ	(1 << 0) /* Support port error interrupt */
+#define FPGA_PORT_CAP_UAFU_IRQ	(1 << 1) /* Support uafu error interrupt */
 	__u32 num_regions;	/* The number of supported regions */
 	__u32 num_umsgs;	/* The number of allocated umsgs */
+	__u32 num_uafu_irqs;    /* The number of uafu interrupts */
 };
 
 #define FPGA_PORT_GET_INFO	_IO(FPGA_MAGIC, PORT_BASE + 1)
@@ -206,6 +210,40 @@ struct fpga_port_umsg_base_addr {
 
 #define FPGA_PORT_UMSG_SET_BASE_ADDR	_IO(FPGA_MAGIC, PORT_BASE + 8)
 
+/**
+ * FPGA_PORT_ERR_SET_IRQ - _IOW(FPGA_MAGIC, PORT_BASE + 9,
+ *                                             struct fpga_port_err_irq_set)
+ *
+ * Set fpga port global error interrupt eventfd
+ * Return: 0 on success, -errno on failure.
+ */
+struct fpga_port_err_irq_set {
+	/* Input */
+	__u32 argsz;		/* Structure length */
+	__u32 flags;		/* Zero for now */
+	__s32 evtfd;		/* Eventfd handler */
+};
+
+#define FPGA_PORT_ERR_SET_IRQ		_IO(FPGA_MAGIC, PORT_BASE + 9)
+
+/**
+ * FPGA_PORT_UAFU_SET_IRQ - _IOW(FPGA_MAGIC, PORT_BASE + 10,
+ *                                             struct fpga_port_uafu_irq_set)
+ *
+ * Set fpga UAFU interrupt eventfd
+ * Return: 0 on success, -errno on failure.
+ */
+struct fpga_port_uafu_irq_set {
+	/* Input */
+	__u32 argsz;		/* Structure length */
+	__u32 flags;		/* Zero for now */
+	__u32 start;		/* First irq number */
+	__u32 count;		/* The number of eventfd handler */
+	__s32 evtfd[];		/* Eventfd handler */
+};
+
+#define FPGA_PORT_UAFU_SET_IRQ		_IO(FPGA_MAGIC, PORT_BASE + 10)
+
 /* IOCTLs for FME file descriptor */
 
 /**
@@ -278,5 +316,39 @@ struct fpga_fme_port_assign {
 };
 
 #define FPGA_FME_PORT_ASSIGN	_IO(FPGA_MAGIC, FME_BASE + 2)
+
+/**
+ * FPGA_FME_GET_INFO - _IOR(FPGA_MAGIC, FME_BASE + 3, struct fpga_fme_info)
+ *
+ * Retrieve information about the fpga fme.
+ * Driver fills the info in provided struct fpga_fme_info.
+ * Return: 0 on success, -errno on failure.
+ */
+struct fpga_fme_info {
+	/* Input */
+	__u32 argsz;		/* Structure length */
+	/* Output */
+	__u32 flags;		/* Zero for now */
+	__u32 capability;	/* The capability of FME device */
+#define FPGA_FME_CAP_ERR_IRQ	(1 << 0) /* Support fme error interrupt */
+};
+
+#define FPGA_FME_GET_INFO      _IO(FPGA_MAGIC, FME_BASE + 3)
+
+/**
+ * FPGA_FME_ERR_SET_IRQ - _IOW(FPGA_MAGIC, FME_BASE + 4,
+ *                                             struct fpga_fme_err_irq_set)
+ *
+ * Set fpga fme global error interrupt eventfd
+ * Return: 0 on success, -errno on failure.
+ */
+struct fpga_fme_err_irq_set {
+	/* Input */
+	__u32 argsz;		/* Structure length */
+	__u32 flags;		/* Zero for now */
+	__s32 evtfd;		/* Eventfd handler */
+};
+
+#define FPGA_FME_ERR_SET_IRQ	_IO(FPGA_MAGIC, FME_BASE + 4)
 
 #endif /* _UAPI_INTEL_FPGA_H */

@@ -38,7 +38,14 @@
 
 DEFINE_FPGA_PR_ERR_MSG(pr_err_msg);
 
-#ifdef CONFIG_AS_AVX512
+#if defined(CONFIG_X86) && defined(CONFIG_AS_AVX512)
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,2,0)
+#include <asm/i387.h>
+#else
+#include <asm/fpu/api.h>
+#endif
+
 static inline void copy512(void *src, void *dst)
 {
 	asm volatile("vmovdqu64 (%0), %%zmm0;"
@@ -47,6 +54,14 @@ static inline void copy512(void *src, void *dst)
 		     : "r"(src), "r"(dst));
 }
 #else
+static inline void kernel_fpu_begin(void)
+{
+}
+
+static inline void kernel_fpu_end(void)
+{
+}
+
 static inline void copy512(void *src, void *dst)
 {
 	WARN_ON_ONCE(1);
@@ -70,15 +85,15 @@ static DEVICE_ATTR_RO(revision);
 static ssize_t interface_id_show(struct device *dev,
 	struct device_attribute *attr, char *buf)
 {
-	struct feature_fme_pr_key intfc_id0_l, intfc_id0_h;
+	struct feature_fme_pr_key intfc_id_l, intfc_id_h;
 	struct feature_fme_pr *fme_pr
 		= get_feature_ioaddr_by_index(dev, FME_FEATURE_ID_PR_MGMT);
 
-	intfc_id0_l.key = readq(&fme_pr->fme_pr_intfc_id0_l);
-	intfc_id0_h.key = readq(&fme_pr->fme_pr_intfc_id0_h);
+	intfc_id_l.key = readq(&fme_pr->fme_pr_intfc_id_l);
+	intfc_id_h.key = readq(&fme_pr->fme_pr_intfc_id_h);
 
 	return scnprintf(buf, PAGE_SIZE, "%016llx%016llx\n",
-			intfc_id0_h.key, intfc_id0_l.key);
+			intfc_id_h.key, intfc_id_l.key);
 }
 
 static DEVICE_ATTR_RO(interface_id);
@@ -174,7 +189,7 @@ static int fme_pr_write(struct fpga_manager *mgr,
 	struct feature_fme_pr_ctl fme_pr_ctl;
 	struct feature_fme_pr_status fme_pr_status;
 	struct feature_fme_pr_data fme_pr_data;
-	int delay = 0, pr_credit;
+	int ret = 0, delay = 0, pr_credit;
 
 	pdev = fme->pdata->dev;
 	fme_pr = get_feature_ioaddr_by_index(&pdev->dev,
@@ -192,16 +207,17 @@ static int fme_pr_write(struct fpga_manager *mgr,
 	fme_pr_status.csr = readq(&fme_pr->ccip_fme_pr_status);
 	pr_credit = fme_pr_status.pr_credit;
 
+	if (fme->pr_avx512)
+		kernel_fpu_begin();
+
 	while (count > 0) {
 		while (pr_credit <= 1) {
 			if (delay++ > PR_WAIT_TIMEOUT) {
 				dev_err(&pdev->dev, "maximum try\n");
 
 				fme->pr_err = pr_err_handle(pdev, fme_pr);
-				if (fme->pr_err)
-					return -EIO;
-
-				return -ETIMEDOUT;
+				ret = fme->pr_err ? -EIO : -ETIMEDOUT;
+				goto done;
 			}
 			udelay(1);
 
@@ -218,11 +234,11 @@ static int fme_pr_write(struct fpga_manager *mgr,
 				       &fme_pr->ccip_fme_pr_data);
 				break;
 			case 64:
-				copy512((void *)buf,
-					&fme_pr->fme_pr_pub_harsh3.key);
+				copy512((void *)buf, &fme_pr->fme_pr_data1);
 				break;
 			default:
-				return -EFAULT;
+				ret = -EFAULT;
+				goto done;
 			}
 
 			buf += fme->pr_bandwidth;
@@ -230,11 +246,16 @@ static int fme_pr_write(struct fpga_manager *mgr,
 			pr_credit--;
 		} else {
 			WARN_ON(1);
-			return -EINVAL;
+			ret = -EINVAL;
+			goto done;
 		}
 	}
 
-	return 0;
+done:
+	if (fme->pr_avx512)
+		kernel_fpu_end();
+
+	return ret;
 }
 
 static int fme_pr_write_complete(struct fpga_manager *mgr,
@@ -408,6 +429,7 @@ static int fpga_fme_pr_probe(struct platform_device *pdev)
 	if (fme_pr_header.revision == 2) {
 		dev_dbg(&pdev->dev, "using 512-bit PR\n");
 		priv->pr_bandwidth = 64;
+		priv->pr_avx512 = true;
 	} else {
 		dev_dbg(&pdev->dev, "using 32-bit PR\n");
 		priv->pr_bandwidth = 4;

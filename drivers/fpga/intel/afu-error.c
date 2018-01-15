@@ -17,6 +17,7 @@
  *
  */
 
+#include <linux/uaccess.h>
 #include "afu.h"
 
 /* Mask / Unmask Port Errors by the Error Mask register. */
@@ -40,7 +41,7 @@ static int port_err_clear(struct device *dev, u64 err)
 {
 	struct feature_port_header *port_hdr;
 	struct feature_port_error *port_err;
-	struct feature_port_err_key error, mask;
+	struct feature_port_err_key mask;
 	struct feature_port_first_err_key first;
 	struct feature_port_status status;
 	int ret = 0;
@@ -67,13 +68,10 @@ static int port_err_clear(struct device *dev, u64 err)
 		return -EBUSY;
 	}
 
-	/* Halt Port if AP6 event detected */
-	error.csr = readq(&port_err->port_error);
-	if (error.ap6_event) {
-		ret = __fpga_port_disable(to_platform_device(dev));
-		if (ret)
-			return ret;
-	}
+	/* Halt Port by keeping Port in reset */
+	ret = __fpga_port_disable(to_platform_device(dev));
+	if (ret)
+		return ret;
 
 	/* Mask all errors */
 	port_err_mask(dev, true);
@@ -93,8 +91,7 @@ static int port_err_clear(struct device *dev, u64 err)
 	port_err_mask(dev, false);
 
 	/* Enable the Port by clear the reset */
-	if (error.ap6_event)
-		__fpga_port_enable(to_platform_device(dev));
+	__fpga_port_enable(to_platform_device(dev));
 
 	return ret;
 }
@@ -201,11 +198,15 @@ static struct attribute_group port_err_attr_group = {
 static int port_err_init(struct platform_device *pdev, struct feature *feature)
 {
 	struct feature_platform_data *pdata = dev_get_platdata(&pdev->dev);
+	struct fpga_afu *afu;
 
 	dev_dbg(&pdev->dev, "PORT ERR Init.\n");
 
 	mutex_lock(&pdata->lock);
 	port_err_mask(&pdev->dev, false);
+	afu = fpga_pdata_get_private(pdata);
+	if (feature->ctx_num)
+		afu->capability |= FPGA_PORT_CAP_ERR_IRQ;
 	mutex_unlock(&pdata->lock);
 
 	return sysfs_create_group(&pdev->dev.kobj, &port_err_attr_group);
@@ -219,8 +220,57 @@ static void port_err_uinit(struct platform_device *pdev,
 	sysfs_remove_group(&pdev->dev.kobj, &port_err_attr_group);
 }
 
+static long port_err_set_irq(struct platform_device *pdev,
+			     struct feature *feature, unsigned long arg)
+{
+	struct feature_platform_data *pdata = dev_get_platdata(&pdev->dev);
+	struct fpga_port_err_irq_set hdr;
+	struct fpga_afu *afu;
+	unsigned long minsz;
+	long ret;
+
+	minsz = offsetofend(struct fpga_port_err_irq_set, evtfd);
+
+	if (copy_from_user(&hdr, (void __user *)arg, minsz))
+		return -EFAULT;
+
+	if (hdr.argsz < minsz || hdr.flags)
+		return -EINVAL;
+
+	mutex_lock(&pdata->lock);
+	afu = fpga_pdata_get_private(pdata);
+	if (!(afu->capability & FPGA_PORT_CAP_ERR_IRQ)) {
+		mutex_unlock(&pdata->lock);
+		return -ENODEV;
+	}
+
+	ret = fpga_msix_set_block(feature, 0, 1, &hdr.evtfd);
+	mutex_unlock(&pdata->lock);
+
+	return ret;
+}
+
+static long
+port_err_ioctl(struct platform_device *pdev, struct feature *feature,
+	       unsigned int cmd, unsigned long arg)
+{
+	long ret;
+
+	switch (cmd) {
+	case FPGA_PORT_ERR_SET_IRQ:
+		ret = port_err_set_irq(pdev, feature, arg);
+		break;
+	default:
+		dev_dbg(&pdev->dev, "%x cmd not handled", cmd);
+		return -ENODEV;
+	}
+
+	return ret;
+}
+
 struct feature_ops port_err_ops = {
 	.init = port_err_init,
 	.uinit = port_err_uinit,
+	.ioctl = port_err_ioctl,
 	.test = port_err_test,
 };

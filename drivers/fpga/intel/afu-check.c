@@ -6,13 +6,13 @@ static void port_check_reg(struct device *dev, void __iomem *addr,
 	u64 value = readq(addr);
 
 	if (value != dflt)
-		dev_err(dev, "%s: incorrect value 0x%llx vs defautl 0x%llx\n",
+		dev_dbg(dev, "%s: incorrect value 0x%llx vs defautl 0x%llx\n",
 				reg_name, (unsigned long long)value,
 				(unsigned long long)dflt);
 }
 
 struct feature_port_header hdr_dflt = {
-	.rsvd1			= 0x0000000000000000,
+	.port_mailbox		= 0x0000000000000000,
 	.scratchpad		= 0x0000000000000000,
 	.capability = {
 		.csr		= 0x0000000100010000,
@@ -36,8 +36,8 @@ int port_hdr_test(struct platform_device *pdev, struct feature *feature)
 	struct feature_port_header *port_hdr = feature->ioaddr;
 
 	/* Check if default value of hardware registers matches with spec */
-	port_check_reg(&pdev->dev, &port_hdr->rsvd1,
-			"hdr:rsvd1", hdr_dflt.rsvd1);
+	port_check_reg(&pdev->dev, &port_hdr->port_mailbox,
+			"hdr:port_mailbox", hdr_dflt.port_mailbox);
 	port_check_reg(&pdev->dev, &port_hdr->scratchpad,
 			"hdr:scratchpad", hdr_dflt.scratchpad);
 	port_check_reg(&pdev->dev, &port_hdr->capability,
