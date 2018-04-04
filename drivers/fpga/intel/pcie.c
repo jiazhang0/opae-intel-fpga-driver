@@ -974,6 +974,9 @@ static int parse_feature(struct build_feature_devs_info *binfo,
 
 	header.csr = readq(hdr);
 
+	dev_dbg(&binfo->pdev->dev, "Parsing feature type %#x id %#x\n",
+		header.type, header.id);
+
 	switch (header.type) {
 	case FEATURE_TYPE_AFU:
 		ret = parse_feature_afus(binfo, hdr);
