@@ -883,10 +883,11 @@ static int parse_feature_afus(struct build_feature_devs_info *binfo,
 		afu_hdr = (struct feature_afu_header *) (hdr + 1);
 		header.csr = readq(&afu_hdr->csr);
 
-		if (feature_is_UAFU(binfo))
+		if (feature_is_UAFU(binfo)) {
 			ret = parse_feature_port_uafu(binfo, hdr);
 			if (ret)
 				return ret;
+		}
 
 		if (!header.next_afu)
 			break;
