@@ -516,6 +516,32 @@ static void build_info_free(struct build_feature_devs_info *binfo)
 }
 
 /*
+ * FPGA hardware bug, FME/PORT GUID didn't follow the UUID/GUID rules, it
+ * it reported at:
+ *    https://hsdes.intel.com/appstore/article/#/1504370325
+ */
+#define FEATURE_FME_GUID "f9e17764-38f0-82fe-e346-524ae92aafbf"
+#define FEATURE_PORT_GUID "6b355b87-b06c-9642-eb42-8d139398b43a"
+
+static bool feature_is_afu_fme(struct feature_afu_header *afu_hdr)
+{
+	uuid_le u;
+
+	uuid_le_to_bin(FEATURE_FME_GUID, &u);
+
+	return !uuid_le_cmp(u, afu_hdr->guid);
+}
+
+static bool feature_is_afu_port(struct feature_afu_header *afu_hdr)
+{
+	uuid_le u;
+
+	uuid_le_to_bin(FEATURE_PORT_GUID, &u);
+
+	return !uuid_le_cmp(u, afu_hdr->guid);
+}
+
+/*
  * UAFU GUID is dynamic as it can be changed after FME downloads different
  * Green Bitstream to the port, so we treat the unknown GUIDs which are
  * attached on port's feature list as UAFU.
@@ -883,11 +909,25 @@ static int parse_feature_afus(struct build_feature_devs_info *binfo,
 		afu_hdr = (struct feature_afu_header *) (hdr + 1);
 		header.csr = readq(&afu_hdr->csr);
 
-		if (feature_is_UAFU(binfo)) {
+		if (feature_is_afu_fme(afu_hdr)) {
+			ret = parse_feature_fme(binfo, hdr);
+			check_features_header(binfo->pdev, hdr, FPGA_DEVT_FME, 0);
+			binfo->pfme_hdr = hdr;
+			if (ret)
+				return ret;
+		} else if (feature_is_afu_port(afu_hdr)) {
+			ret = parse_feature_port(binfo, hdr);
+			check_features_header(binfo->pdev, hdr, FPGA_DEVT_PORT, 0);
+			enable_port_uafu(binfo, hdr);
+			if (ret)
+				return ret;
+		} else if (feature_is_UAFU(binfo)) {
 			ret = parse_feature_port_uafu(binfo, hdr);
 			if (ret)
 				return ret;
-		}
+		} else
+			dev_info(&binfo->pdev->dev, "AFU GUID %pUl is not supported yet.\n",
+				 afu_hdr->guid.b);
 
 		if (!header.next_afu)
 			break;
